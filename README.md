@@ -160,7 +160,7 @@ See [TECHNICAL_DETAILS.md](TECHNICAL_DETAILS.md) for a full breakdown of analyti
 
 ## Contact & License
 
-- **Author:** [Your Name or GitHub]
+- **Author:** Jakub Bartkowiak
 - **License:** MIT (see LICENSE file)
 - **Issues/PRs:** Contributions welcome!
 
