@@ -1,0 +1,75 @@
+# settings.yaml.example
+# Version: 2.2.0
+# Last Updated: 2025-06-11
+# Description: Example configuration for the Audiobook Reorganization tool.
+#
+# This file configures the system's behavior, including library paths,
+# processing options, and metadata enrichment strategies. The system now
+# prioritizes the local OpenLibrary mirror for fast and efficient metadata
+# lookups.
+
+# --- Core Paths ---
+library_root: "/path/to/audio_library"   # Root directory for audiobook files
+staging_db_path: "staging.db"          # Path to the staging database file
+
+# --- Processing Settings ---
+batch_size: 5              # Number of books/files processed per batch
+dryrun_default: false      # If true, runs in dry-run mode by default (no file moves)
+offline_mode: false        # If true, disables all remote API/network calls
+
+# --- Backup Settings ---
+backup_zip: true           # Enable backup of original files before move
+backup_retention_days: 30  # Days to retain backup zips
+
+# --- Normalization & Cleaning ---
+alias_map: "alias_map.json"    # Path to alias mapping file for author/title normalization
+author_blacklist:
+  - book                   # Blacklisted words for author name cleaning
+  - audiobook
+  - volume
+  - edition
+  - series
+  - best
+author_max_length: 50      # Max length for author names
+year_pattern: "(19|20)\\d{2}"  # Regex for extracting publication year
+
+# --- OpenLibrary Mirror Settings ---
+openlibrary_mirror:
+  db_path: "openlibrary_mirror.db"  # Path to the local OpenLibrary mirror SQLite database
+  dump_url: "https://openlibrary.org/data/ol_dump_latest.txt.gz" # URL for the OpenLibrary data dump
+  update_interval_days: 7 # How often to check for mirror updates
+
+# --- LLM Fallback (Optional) ---
+self_hosted_llm: false         # If true, use a self-hosted LLM endpoint
+# LLM configuration (used for metadata enrichment if OpenLibrary fails or confidence is low)
+llm_provider:
+  # provider: "openai"
+  # api_key: "YOUR_API_KEY"
+  # model: "gpt-4-turbo-preview"
+  model: "gpt-4o"                # LLM model name
+  api_key_env: "OPENAI_API_KEY" # Environment variable for API key
+  url: "http://localhost:8000/chat"  # URL for self-hosted LLM
+  extra_lazy: false  # Use a smaller, less resource-intensive LLM
+
+llm_batch_size: 5                # Number of items per LLM enrichment batch
+
+# GUI configuration
+gui:
+  page_size: 35       # Number of books per page in GUI
+  book_view: true     # Show book-level view by default
+
+# OpenLibrary mirror configuration (preferred for enrichment)
+openlibrary:
+  use_local_mirror: true            # Use local OpenLibrary SQLite mirror if available
+  mirror_db: "./ol_mirror.sqlite"  # Path to local OpenLibrary mirror DB
+  cache_ttl_days: 30                # Days to cache OpenLibrary lookups
+  # List of OpenLibrary mirror URLs for the full "all types" dump (~12GB)
+  mirrors:
+    - url: "https://openlibrary.org/data/ol_dump_latest.txt.gz"           # Official OpenLibrary
+    - url: "https://archive.org/download/ol_exports_2024-06-01/ol_dump_latest.txt.gz"  # Fallback: Archive.org direct
+  # The updater will try each mirror in order if the previous fails.
+
+# Confidence thresholds (used to determine if LLM enrichment is needed)
+confidence:
+  min_confidence: 0.60              # Minimum confidence for auto-grouping (chaptered)
+  llm_threshold: 0.50               # Only use LLM if confidence is below this value
