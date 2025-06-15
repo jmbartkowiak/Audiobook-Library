@@ -397,15 +397,6 @@ This system ensures that LLM usage is minimized while still providing high-quali
 
 ---
 
-## 8 · Design Challenges & Technical Debt (v2.2.0)
-
-| Challenge                              | Solution                                          | Status & Trade-offs                               |
-| -------------------------------------* | ------------------------------------------------* | -----------------------------------------------* |
-| **Cross-thread SQLite**               | Per-thread connections with WAL mode             | ✅ Stable but requires proper connection cleanup  |
-| **Rate-limited APIs**                 | Multi-level caching with exponential backoff      | 🔄 Mirror DB optimized to ~12GB with compression  |
-| **Large Libraries**                   | Virtualized scrolling with batch loading          | ⚡ Handles 100k+ files with <2s UI response      |
-| **Schema Management**                 | Custom, automatic migrations via `staging_db.py`  | 🔄 Adds missing columns on startup             |
-| **File Operations**                   | Asynchronous I/O with progress reporting          | ⚠️ Windows path length limitations still apply    |
 
 ### Performance Optimizations (v2.2.0)
 
@@ -422,7 +413,7 @@ This system ensures that LLM usage is minimized while still providing high-quali
 
 ---
 
-## 9 · Technical Implementation Highlights (v2.2.0)
+## 8 · Technical Implementation Highlights (v2.2.0)
 
 ### Core Algorithms
 
@@ -486,7 +477,7 @@ python utils/build_mirror.py --input ol_dump_latest.txt.gz --output ol_mirror.sq
 ---
 
 
-## 10 · Limitations & Future Road-map
+## 9 · Limitations & Future Road-map
 
 * **Format Expansion** – add `.aac`, `.wav`, `.pdf` parsing modules.
 * **Metadata Write-back** – push canonical tags into file headers post-move.
