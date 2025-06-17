@@ -19,6 +19,7 @@ This project is a robust, production-grade system for organizing, cleaning, and 
 - **LLM & OpenLibrary Integration:** Enriches metadata using OpenAI or self-hosted LLMs, plus local or remote OpenLibrary lookups.
 - **Batch Processing:** Efficiently handles thousands of files with batch conversion, progress tracking, and error handling.
 - **Extensible & Modular:** Codebase is organized for easy extension to new media types, enrichment sources, or deployment environments.
+- **Limited AI Use:** Gemini 2.5 pro was used exclusively to track Revision History and ensure PEP8 compatibility throughout codebase post v2.2.0
 
 ## Project Evolution & Engineering Journey
 
