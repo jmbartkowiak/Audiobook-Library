@@ -1,7 +1,7 @@
 # Audiobook/E-book Reorganization System v2.3.X
 
 **Last Update:** 2025-06-11  
-**Version:** 2.2.0
+**Version:** 2.3.X [Major.Minor.Hotfix]
 
 ---
 
