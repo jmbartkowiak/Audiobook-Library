@@ -1,7 +1,7 @@
 """
 ui_frontend.py
-Last update: 2025-06-10
-Version: 2.2.2
+Last update: 2025-06-15
+Version: 2.3.0
 Description:
     Responsive PySimpleGUI interface for Audiobook/E-book Reorg. Provides an interactive, 
     user-friendly GUI for managing, reviewing, and converting large audiobook/e-book libraries. 
@@ -27,22 +27,21 @@ Description:
     - load_files_for_book:line 199 - Lazily loads file details when a book is expanded
     - view_diff:line 216 - Shows a popup with source and destination paths for a file
 """
-import threading
 import queue
 import PySimpleGUI as sg
 from staging_db import StagingDB
 from tasks import run_scan_task, run_enrich_task, run_convert_task, run_undo_task
+from utils import setup_logging, BookGroup, RawMeta, load_and_prepare_config, get_library_snapshot, load_library_stats
 from openlibrary_mirror import MirrorUpdater
 import time
-from typing import Any, Dict
-import json
 import threading
+from typing import Any, Dict
 from pathlib import Path
 import logging
-import os
 import tempfile
+import json
 import yaml
-import yaml
+import os
 
 def _create_confidence_bar(confidence: float) -> str:
     """Create a colored confidence bar visualization."""
@@ -76,7 +75,7 @@ def _format_confidence_details(details: dict) -> str:
     
     return '\n'.join(lines)
 
-def launch_gui(cfg: dict, db: 'StagingDB') -> None:
+def launch_gui() -> None:
     """
     Responsive PySimpleGUI interface for Audiobook/E-book Reorg.
     Features:
@@ -87,6 +86,11 @@ def launch_gui(cfg: dict, db: 'StagingDB') -> None:
     - Expandable book/chapter tree with confidence indicators
     - Automatic OpenLibrary mirror update at startup if needed
     """
+    cfg = load_and_prepare_config()
+    # Access paths through the nested paths structure
+    paths_cfg = cfg.get('paths', {})
+    db = StagingDB(paths_cfg.get('staging_db_path'))
+
     # --- GUI Configuration ---
     gui_cfg = cfg.get("gui", {})
     dark_mode = gui_cfg.get("dark_mode", False)
@@ -94,7 +98,13 @@ def launch_gui(cfg: dict, db: 'StagingDB') -> None:
     # --- Master loop to allow for window recreation (e.g., for theme/column changes) ---
     while True:
         # --- Theme and Styling ---
-        sg.theme("DarkGrey2" if dark_mode else "LightGrey1")
+        theme_string = gui_cfg.get("theme", "DarkBlue3") if dark_mode else "LightGrey1"
+        try:
+            # Try the older method for backward compatibility
+            sg.ChangeLookAndFeel(theme_string)
+        except AttributeError:
+            # Fallback to the modern method
+            sg.theme(theme_string)
         
         # Get latest GUI config for this loop iteration
         visible_columns = gui_cfg.get("columns", ["ID", "Authors", "Book", "Conf", "Discrep", "Type"])
@@ -112,7 +122,7 @@ def launch_gui(cfg: dict, db: 'StagingDB') -> None:
                 "book_view": book_view,
             }
 
-            settings_path = Path("settings.yaml")
+            settings_path = Path(__file__).parent / "settings.yaml"
             temp_path = None
             try:
                 # Create a temporary file in the same directory to ensure atomic move
@@ -192,6 +202,40 @@ def launch_gui(cfg: dict, db: 'StagingDB') -> None:
 
         bottom_buttons = [sg.Button("Refresh", tooltip="Reload book list from database"), sg.Button("View Diff", tooltip="Show file differences"), sg.Button("Quit", tooltip="Exit the application")]
 
+        # --- Auto-scan logic ---
+        def check_and_run_scan(window, action_queue):
+            # Get stats path from the same directory as the staging database
+            stats_path = Path(paths_cfg.get('staging_db_path', 'staging.db')).parent / "library_stats.json"
+            
+            # Check if any source directories exist
+            source_roots = []
+            if paths_cfg.get('source_audiobook_root'):
+                source_roots.append(paths_cfg['source_audiobook_root'])
+            if paths_cfg.get('source_ebook_root'):
+                source_roots.append(paths_cfg['source_ebook_root'])
+
+            current_snapshot = get_library_snapshot(source_roots)
+
+            needs_scan = False
+            if not last_stats:
+                reason = "No previous statistics found."
+                needs_scan = True
+            elif (last_stats.get("total_files") != current_snapshot.get("total_files") or
+                  last_stats.get("total_size") != current_snapshot.get("total_size")):
+                reason = "Library changes detected."
+                needs_scan = True
+
+            if needs_scan:
+                window["-ACTION_STATUS-"].update(f"{reason} Starting automatic scan...", visible=True)
+                window["-SCAN-"].update(disabled=True)
+                # Use the main action_queue for consistency
+                def task_callback(p, t, m):
+                    # This callback is simple for the auto-scan, we just need to know it's running
+                    pass
+                threading.Thread(target=_run_task, args=(run_scan_task, cfg, db, task_callback), daemon=True).start()
+            else:
+                window["-ACTION_STATUS-"].update("No library changes detected. Scan skipped.", visible=True)
+
         layout = [
             controls,
             [tree],
@@ -201,6 +245,10 @@ def launch_gui(cfg: dict, db: 'StagingDB') -> None:
             bottom_buttons
         ]
         window = sg.Window(f"Audiobook Reorg v{cfg.get('version', '2.2.0')}", layout, resizable=True, finalize=True)
+
+        # Trigger initial data load and auto-scan check
+        window.write_event_value('-AUTO_SCAN_CHECK-', None)
+        window.write_event_value('-REFRESH-', None)
 
         # --- Data Loading and Caching --- #
         books_cache = {}
@@ -309,8 +357,18 @@ def launch_gui(cfg: dict, db: 'StagingDB') -> None:
         # --- Main Event Loop ---
         while True:
             event, values = window.read(timeout=100) # Timeout allows queue checking
-            if event == sg.WIN_CLOSED or event == "Quit":
+
+            if event == sg.WIN_CLOSED or event == 'Quit' or event == sg.WINDOW_CLOSE_ATTEMPTED_EVENT:
                 break
+
+            if event == "-BULB-":
+                dark_mode = not dark_mode
+                save_gui_config()
+                window.close()
+                break  # Break from inner loop to recreate window
+
+            if event == '-AUTO_SCAN_CHECK-':
+                check_and_run_scan(window, action_queue)
 
             # --- Handle background task completion ---
             try:
@@ -409,8 +467,52 @@ def launch_gui(cfg: dict, db: 'StagingDB') -> None:
             elif event == "View Diff":
                 if values["-TREE-"]: view_diff(values["-TREE-"][0])
                 else: sg.popup_error("Please select an item to view the difference.", title="No Selection")
-            elif event in ("Enrich", "Undo", "Convert"):
-                sg.popup_ok(f'The "{event}" feature is not yet implemented.', title="Coming Soon")
+            elif event == "Enrich":
+                selected = values["-TREE-"]
+                if selected:
+                    try:
+                        # Run enrichment in a thread to keep UI responsive
+                        threading.Thread(
+                            target=run_enrich_task,
+                            args=(cfg, db, lambda p, t, m: window.write_event_value("-PROGRESS-", (p, t, m))),
+                            daemon=True
+                        ).start()
+                    except Exception as e:
+                        logging.error(f"Error during enrichment: {e}", exc_info=True)
+                        sg.popup_error(f"Error during enrichment: {e}", title="Error")
+                else:
+                    sg.popup_ok("Please select one or more items to enrich.", title="No Selection")
+                    
+            elif event == "Undo":
+                try:
+                    result = run_undo_task(cfg, db)
+                    if 'error' in result:
+                        sg.popup_error(f"Error during undo: {result['error']}", title="Error")
+                    elif result.get('reverted_count', 0) > 0:
+                        sg.popup_ok(f"Successfully reverted {result['reverted_count']} file(s).", title="Undo Complete")
+                        load_book_overview()  # Refresh the view
+                    else:
+                        sg.popup_ok("No operations to undo.", title="Nothing to Undo")
+                except Exception as e:
+                    logging.error(f"Error during undo: {e}", exc_info=True)
+                    sg.popup_error(f"Error during undo: {e}", title="Error")
+                    
+            elif event == "Convert":
+                try:
+                    # Get batch size from config or use default
+                    batch_size = cfg.get('batch_size', 100)
+                    dryrun = cfg.get('dryrun_default', True)
+                    
+                    # Run conversion in a thread to keep UI responsive
+                    threading.Thread(
+                        target=run_convert_task,
+                        args=(cfg, db, batch_size, dryrun, 
+                             lambda p, t, m: window.write_event_value("-PROGRESS-", (p, t, m))),
+                        daemon=True
+                    ).start()
+                except Exception as e:
+                    logging.error(f"Error during conversion: {e}", exc_info=True)
+                    sg.popup_error(f"Error during conversion: {e}", title="Error")
 
         window.close()
         save_gui_config()

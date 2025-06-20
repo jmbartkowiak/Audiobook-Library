@@ -1,7 +1,7 @@
 """
 pipeline.py
-Version: 2.2.2
-Last Update: 2025-06-10
+Version: 2.3.0
+Last Update: 2025-06-20
 Description:
     Entry-point and Command-Line Interface (CLI) for the Audiobook Reorganization
     tool. This script parses command-line arguments and orchestrates the high-level
@@ -16,17 +16,14 @@ Directory:
 import argparse
 import json
 import sys
-import yaml
 from pathlib import Path
-
-# Core logic is now in library_core
-from library_core import scan_files, group_books, enrich_books, stage_plan, perform_moves
+from utils import load_and_prepare_config
+from library_core import scan_files, group_books, enrich_books, perform_moves
 from staging_db import StagingDB
-from utils import validate_config
 
 def parse_args():
     """Define and parse command-line arguments for the application."""
-    parser = argparse.ArgumentParser(description="Audiobook/Ebook Reorg v2.2.0")
+    parser = argparse.ArgumentParser(description="Audiobook/Ebook Reorg v2.2.2b")
     subparsers = parser.add_subparsers(dest="command", required=True)
     
     scan_p = subparsers.add_parser("scan", help="Scan library, enrich, and stage a reorganization plan.")
@@ -45,13 +42,7 @@ def parse_args():
 
 def main():
     """Main entry point for the Audiobook Reorg application."""
-    cfg_path = Path("settings.yaml")
-    if not cfg_path.exists():
-        print("Error: settings.yaml not found.", file=sys.stderr)
-        sys.exit(1)
-
-    cfg = yaml.safe_load(cfg_path.read_text())
-    validate_config(cfg)
+    cfg = load_and_prepare_config()
 
     # Load alias map
     alias_map = {}
@@ -75,8 +66,7 @@ def main():
         print(f"Found {len(raw_files)} audio files.")
         if not args.dryrun:
             groups = group_books(raw_files, cfg)
-            enrich_books(groups, cfg)
-            stage_plan(groups, cfg, db)
+            enrich_books(groups, cfg, db)
             print("Plan staged successfully.")
         else:
             print("Dry run: Scan complete. No changes staged.")
@@ -84,7 +74,7 @@ def main():
     elif args.command == "gui":
         from ui_frontend import launch_gui
         print("Launching GUI...")
-        launch_gui(cfg, db)
+        launch_gui()
 
     elif args.command == "convert":
         batch_size = args.batch or cfg.get('batch_size', 100)
@@ -93,7 +83,22 @@ def main():
         perform_moves(cfg, db, batch_size, dryrun)
 
     elif args.command == "undo":
-        print(f"Undo command is not yet implemented.")
+        print(f"Undoing last operation...")
+        try:
+            result = db.undo_last()
+            if 'error' in result:
+                print(f"Error during undo: {result['error']}", file=sys.stderr)
+                sys.exit(1)
+            
+            reverted_count = result.get('reverted_count', 0)
+            if reverted_count > 0:
+                print(f"Successfully reverted {reverted_count} file(s).")
+            else:
+                print("No operations to undo.")
+                
+        except Exception as e:
+            print(f"Error during undo operation: {e}", file=sys.stderr)
+            sys.exit(1)
 
 if __name__ == "__main__":
     main()

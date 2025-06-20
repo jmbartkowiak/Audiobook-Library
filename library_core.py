@@ -1,7 +1,7 @@
 """
 library_core.py
-Last update: 2025-06-10
-Version: 2.2.2
+Last update: 2025-06-15
+Version: 2.3.0
 Description:
     Core logic for Audiobook/E-book Reorg. Handles file scanning, metadata extraction, grouping, 
     enrichment, and destination path calculation. Integrates with DB and GUI for full pipeline automation.
@@ -28,11 +28,13 @@ from __future__ import annotations
 import asyncio, httpx, hashlib, logging, json, yaml, time, re
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Tuple, Set, Callable
+from difflib import HtmlDiff
 
-from fuzzywuzzy import fuzz
+import shutil
+from rapidfuzz import fuzz
 
 from tenacity import retry, wait_exponential, stop_after_attempt
-from utils import validate_config
+from utils import BackupManager
 
 import magic
 from mutagen import File as AudioFile
@@ -210,10 +212,16 @@ def parse_from_filename(stem: str, alias_map: Dict[str, str]) -> Dict[str, Optio
     return {"authors": [], "title": None, "year": None}
 
 def scan_files(cfg: Dict[str, any], alias_map: Dict[str, str], progress_callback: Optional[Callable] = None) -> List[RawMeta]:
-    """Recursively scan roots for media files and extract raw metadata."""
-    roots = [Path(cfg["library_root"])]
-    if cfg.get("ebook_root"):
-        roots.append(Path(cfg["ebook_root"]))
+    """Recursively scan source roots for media files and extract raw metadata."""
+    roots = []
+    if cfg.get("source_audiobook_root"):
+        roots.append(Path(cfg["source_audiobook_root"]))
+    if cfg.get("source_ebook_root"):
+        roots.append(Path(cfg["source_ebook_root"]))
+
+    if not roots:
+        logging.error("No source directories configured. Please set 'source_audiobook_root' or 'source_ebook_root' in settings.yaml.")
+        return []
     raws: List[RawMeta] = []
     exts = {".mp3", ".m4a", ".flac", ".epub", ".mobi"}
     all_files = []
@@ -276,17 +284,16 @@ def enrich_books(
     """
     Enrich BookGroup metadata using OpenLibrary and potentially other services.
     """
-    from difflib import HtmlDiff
-
     cache: dict = {}
-    use_mirror: bool = cfg.get("openlibrary", {}).get("use_local_mirror", False)
-    mirror_db: str = cfg.get("openlibrary", {}).get("mirror_db", "./ol_mirror.sqlite")
+    openlibrary_cfg = cfg.get("openlibrary", {})
+    use_mirror: bool = openlibrary_cfg.get("use_local_mirror", False)
+    mirror_db: str = openlibrary_cfg.get("mirror_db")
 
     total_groups = len(groups)
     for i, grp in enumerate(groups):
         if lazy_mode:
             grp.canonical = {"title": grp.title, "authors": grp.authors, "year": None, "genre": None, "status": "Lazy"}
-            db.stage_book(grp)
+            db.stage_book(grp, cfg)
             continue
 
         ol_result = None
@@ -308,175 +315,128 @@ def enrich_books(
                 "status": "Original"
             }
 
-        # Compute diff
-        old = [grp.title] + grp.authors
-        new = [grp.canonical["title"]] + grp.canonical["authors"]
-        diff = HtmlDiff()
-        grp.diff_html = diff.make_table(old, new, "Original", "Canonical")
-        grp.discrepancy = fuzz.ratio(str(old), str(new))
-
-        db.stage_book(grp)
-
         # Blacklist check
         blacklist = ["TORRENTZ", "SAMPLE", "DEMO", "PROMO"]
         blacklist_hit = any(any(term in (str(f.path).upper() + str(f.tags.get('title', '')).upper()) for term in blacklist) for f in grp.files)
         if blacklist_hit:
             grp.canonical['status'] = 'Blacklisted'
 
-        if progress_callback:
-            progress_callback(i + 1, total_groups, grp.title)
-        # OpenLibrary ratio: set to 0 for now (can be filled after OL call)
-        ol_ratio = 0.0
-        # Initialize the confidence scorer with the config
-        confidence_scorer = EnrichmentConfidence(cfg.get("confidence", {}))
-        
-        # Calculate enrichment confidence
-        grp.enrich_confidence = confidence_scorer.calculate_confidence(
-            title=title,
-            author=author,
-            folder=folder,
-            filename=filename,
-            ol_ratio=ol_ratio,
-            file_count=file_count,
-            mean_mb=mean_mb,
-            total_mb=total_mb,
-            bitrate_sigma=bitrate_sigma,
-            blacklist_hit=blacklist_hit
-        )
-
-        # Use new confidence thresholds from config
-        conf_thresh = cfg.get("confidence_threshold", 0.70)
-        grey_zone = cfg.get("grey_zone", 0.60)
-
-        # 1. If already high enrich_confidence, skip enrichment
-        if grp.enrich_confidence >= conf_thresh:
-            grp.canonical = {
-                "title": grp.title,
-                "authors": grp.authors,
-                "year": grp.files[0].tags.get("year"),
-                "genre": grp.files[0].tags.get("genre"),
-                "status": "Confident"
-            }
-            db.stage_book(grp)
-            continue
-        # 2. Try OpenLibrary mirror (local if configured)
-        ol_result = None
-        if use_mirror:
-            try:
-                ol_result = lookup_book(mirror_db, grp.title, grp.authors[0] if grp.authors else "")
-            except Exception as e:
-                logging.debug(f"OpenLibrary mirror failed: {e}")
-        # 3. Fallback to remote OpenLibrary if allowed and mirror failed
-        if not ol_result:
-            try:
-                ol_result = open_library_search(grp.title, grp.authors[0] if grp.authors else "", cache)
-            except Exception as e:
-                logging.debug(f"Remote OpenLibrary failed: {e}")
-        # 4. If OpenLibrary gave a result, check if it boosts confidence
-        if ol_result:
-            # Heuristic: use fuzzy match to check if OL result is a good fit
-            from rapidfuzz import fuzz as _fuzz
-            title_score = _fuzz.ratio(grp.title.lower(), ol_result.get("title", "").lower())
-            author_score = _fuzz.ratio(grp.authors[0].lower() if grp.authors else "", ol_result.get("authors", [""])[0].lower())
-            # If both scores are high, accept OL result
-            if title_score >= 80 and author_score >= 80:
-                grp.canonical = ol_result
-                grp.canonical["status"] = "OpenLibrary"
-                db.stage_book(grp)
-                continue
-        # 5. If confidence is below LLM threshold, add to LLM queue
-        if grp.enrich_confidence < llm_thresh:
-            queue_list.append((grp, {"title": grp.title, "author": grp.authors[0] if grp.authors else ""}))
-        else:
-            # If not eligible for LLM, fallback to minimal tags
-            grp.canonical = {
-                "title": grp.title,
-                "authors": grp.authors,
-                "year": grp.files[0].tags.get("year"),
-                "genre": grp.files[0].tags.get("genre"),
-                "status": "LowConfidence"
-            }
-        db.stage_book(grp)
-        if progress_callback:
-            progress_callback(i + 1, total_groups, grp.title)
-    # 6. Batch LLM enrichment for queued groups
-    for i in range(0, len(queue_list), batch_size):
-        chunk = queue_list[i:i + batch_size]
-        recs = [r for _, r in chunk]
-        results = _llm_enrich_batch(recs, cfg)
-        for (grp, _), res in zip(chunk, results):
-            if res:
-                grp.canonical = res
-                grp.canonical["status"] = "LLM"
-            else:
-                # If LLM fails, fallback to minimal tags
-                grp.canonical = {
-                    "title": grp.title,
-                    "authors": grp.authors,
-                    "year": grp.files[0].tags.get("year"),
-                    "genre": grp.files[0].tags.get("genre"),
-                    "status": "LLMFailed"
-                }
-        if progress_callback:
-            progress_callback(i + batch_size, len(queue_list), "LLM Enrichment")
-
-    # 7. Compute diff and discrepancy for GUI and audit
-    from difflib import HtmlDiff
-    from rapidfuzz import fuzz
-    for grp in groups:
+        # Compute diff and discrepancy for GUI and audit
         old = [grp.title] + grp.authors
         new = [grp.canonical["title"]] + grp.canonical["authors"]
         diff = HtmlDiff()
         grp.diff_html = diff.make_table(old, new, "Original", "Canonical")
         grp.discrepancy = fuzz.ratio(str(old), str(new))
 
-def perform_moves(cfg: Dict[str, any], db, batch_size: int,
+        db.stage_book(grp, cfg)
+
+        if progress_callback:
+            progress_callback(i + 1, total_groups, grp.title)
+
+def perform_moves(cfg: Dict[str, any], db: StagingDB, batch_size: int,
                   dryrun: bool=False, progress_callback: Optional[Callable]=None):
-    bm = BackupManager(cfg) if cfg["backup_zip"] else None
+    """
+    Processes files pending conversion from the database.
+
+    For each file, it performs the move from its source to its calculated
+    destination. It also handles backing up the file if configured, marks
+    the file as converted in the database, updates the staging_plan status,
+    and provides progress updates.
+
+    Args:
+        cfg: Configuration dictionary.
+        db: StagingDB instance for database operations.
+        batch_size: The maximum number of files to process.
+        dryrun: If True, simulates moves without touching files.
+        progress_callback: Optional function to report progress.
+    """
+    bm = BackupManager(cfg) if cfg.get("backup_zip") else None
     items = db.get_pending_files(limit=batch_size)
     total_pending = len(items)
+    
+    if not total_pending:
+        logging.info("No pending files to move.")
+        return
+        
+    logging.info(f"Starting move operation for {total_pending} files.")
     moved_count = 0
-    for idx,it in enumerate(items, start=1):
-        src=Path(it["src"]); dst=Path(it["dst"])
-        if bm: bm.backup_file(src)
-        if not dryrun:
-            tmp=dst.with_suffix(dst.suffix+".partial")
-            tmp.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src,tmp); tmp.replace(dst); src.unlink()
-        db.mark_converted(it["file_id"])
-        moved_count += 1
-        if progress_callback:
-            progress_callback(idx, total_pending, f"Moved: {moved_count}")
-    3. Calculates destination paths for all files
-    4. Stages the enriched data in the database
     
-    Args:
-        groups: List of BookGroup objects to process
-        cfg: Configuration dictionary
-        db: StagingDB instance for database operations
+    # Get database connection for transaction
+    conn = db.conn
     
-    Returns:
-        None
-    """
     try:
-        validate_config(cfg)
-    except (ValueError, TypeError) as e:
-        logging.error(f"Configuration error: {e}", exc_info=True)
-        return  # Stop processing if config is invalid
+        with conn:
+            for idx, it in enumerate(items, start=1):
+                try:
+                    src = Path(it["src"])
+                    dst = Path(it["dst"])
+                    
+                    if not src.exists():
+                        logging.warning(f"Source file not found, skipping: {src}")
+                        db.mark_converted(it["file_id"], error="Source not found")
+                        # Update staging_plan status for this file
+                        conn.execute("""
+                            UPDATE staging_plan 
+                            SET status = 'error', 
+                                error = ?
+                            WHERE src = ?
+                        """, ("Source file not found", str(src)))
+                        continue
 
-    enrich_books(groups, cfg, lazy_mode=cfg.get("offline_mode", False))
-    
-    db.clear_staging()
-    
-    for grp in groups:
-        for raw in grp.files:
-            dst = calculate_destination_path(cfg, grp, raw)
-            db.stage_file(
-                src_path=str(raw.path),
-                dst_path=str(dst),
-                group_id=f"{grp.authors[0]} - {grp.title}",
-                confidence=grp.enrich_confidence,
-                discrepancy=grp.discrepancy,
-                diff_html=grp.diff_html,
-                warning_html=grp.warning_html
-            )
+                    # Update status to 'processing' in staging_plan
+                    conn.execute("""
+                        UPDATE staging_plan 
+                        SET status = 'processing'
+                        WHERE src = ?
+                    """, (str(src),))
+
+                    if bm:
+                        bm.backup_file(src, cfg)
+
+                    if not dryrun:
+                        tmp = dst.with_suffix(dst.suffix + ".partial")
+                        tmp.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src, tmp)
+                        tmp.replace(dst)
+                        src.unlink()
+                        logging.debug(f"Moved {src} -> {dst}")
+
+                    # Mark as processed in files table
+                    db.mark_converted(it["file_id"])
+                    
+                    # Update staging_plan status to 'done'
+                    conn.execute("""
+                        UPDATE staging_plan 
+                        SET status = 'done',
+                            processed_at = CURRENT_TIMESTAMP
+                        WHERE src = ?
+                    """, (str(src),))
+                    
+                    moved_count += 1
+                    
+                    if progress_callback:
+                        progress_callback(idx, total_pending, f"Moved: {moved_count}/{total_pending}")
+                
+                except Exception as e:
+                    error_msg = str(e)
+                    logging.error(f"Failed to move file {it.get('src', 'unknown')}: {error_msg}", exc_info=True)
+                    if "file_id" in it:
+                        db.mark_converted(it["file_id"], error=error_msg)
+                    # Update staging_plan with error status
+                    conn.execute("""
+                        UPDATE staging_plan 
+                        SET status = 'error',
+                            error = ?,
+                            processed_at = CURRENT_TIMESTAMP
+                        WHERE src = ?
+                    """, (error_msg, str(it.get('src', ''))))
+                    
+                    # Continue with next file even if one fails
+                    continue
+                    
+    except Exception as e:
+        logging.critical(f"Fatal error during move operation: {e}", exc_info=True)
+        raise
+
+    logging.info(f"Move operation complete. Moved {moved_count} of {total_pending} files.")
+    return {"moved": moved_count, "total": total_pending}

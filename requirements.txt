@@ -16,3 +16,4 @@ rapidfuzz==3.13.0
 requests==2.32.4
 tenacity==9.1.2
 textdistance==4.6.3
+openlibrary-to-sqlite>=1.0.0 # For converting OpenLibrary TSV dumps to SQLite

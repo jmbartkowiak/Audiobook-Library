@@ -1,75 +1,130 @@
+# -----------------------------------------------------------------------------
 # settings.yaml.example
-# Version: 2.2.0
-# Last Updated: 2025-06-11
-# Description: Example configuration for the Audiobook Reorganization tool.
+# Version: 2.3.0
 #
-# This file configures the system's behavior, including library paths,
-# processing options, and metadata enrichment strategies. The system now
-# prioritizes the local OpenLibrary mirror for fast and efficient metadata
-# lookups.
+# Description:
+# This is an example configuration file for the Audiobook tool.
+# Copy this file to 'settings.yaml' and customize it based on the  explanations for each setting
+# -----------------------------------------------------------------------------
 
 # --- Core Paths ---
-library_root: "/path/to/audio_library"   # Root directory for audiobook files
-staging_db_path: "staging.db"          # Path to the staging database file
+# These paths define the fundamental locations for your library and database.
+# Using relative paths (e.g., "./_library") is recommended for portability.
+# -----------------------------------------------------------------------------
+paths:
+  # Source and destination directories for audiobooks
+  source_audiobook_root: "./_library/audiobooks"
+  destination_audiobook_root: "./_library/organized_audiobooks"
+  
+  # Source and destination directories for ebooks (optional)
+  source_ebook_root: "./_library/ebooks"
+  destination_ebook_root: "./_library/organized_ebooks"
+  
+  # Path to the staging database
+  staging_db_path: "./staging.db"
+  
+  # Path to the alias map file (for author/title normalization)
+  alias_map: "./alias_map.json"
 
-# --- Processing Settings ---
-batch_size: 5              # Number of books/files processed per batch
-dryrun_default: false      # If true, runs in dry-run mode by default (no file moves)
-offline_mode: false        # If true, disables all remote API/network calls
+# --- Operational Flags ---
+# These settings control the application's behavior during execution.
+# -----------------------------------------------------------------------------
+batch_size: 5               # The number of books to process in a single batch. Lower this if you encounter memory issues.
+dryrun_default: false       # If true, the application will only simulate changes without moving or modifying any files.
+offline_mode: false         # If true, disables all network requests (e.g., to OpenLibrary or LLM providers).
+backup_zip: false           # If true, creates a zip archive of files before they are moved or modified.
+backup_retention_days: 30   # How many days to keep backup files before they are automatically deleted.
 
-# --- Backup Settings ---
-backup_zip: true           # Enable backup of original files before move
-backup_retention_days: 30  # Days to retain backup zips
+# --- Metadata Handling ---
+# Configure how the application interprets and cleans up file metadata.
+# -----------------------------------------------------------------------------
+alias_map: "alias_map.json"             # Path to a JSON file that maps author name variations to a canonical name (e.g., {"J.K. Rowling": "Joanne Rowling"}).
+author_blacklist:                       # A list of author names to ignore during processing. Useful for excluding generic names.
+  - "Various Artists"
+  - "Unknown Artist"
+  - "VA"
+  - "book"
+  - "audiobook"
+author_max_length: 75                   # Maximum character length for an author's name to be considered valid.
+year_pattern: "\\b(19|20)\\d{2}\\b"     # A regular expression to extract the publication year from filenames or folder names.
 
-# --- Normalization & Cleaning ---
-alias_map: "alias_map.json"    # Path to alias mapping file for author/title normalization
-author_blacklist:
-  - book                   # Blacklisted words for author name cleaning
-  - audiobook
-  - volume
-  - edition
-  - series
-  - best
-author_max_length: 50      # Max length for author names
-year_pattern: "(19|20)\\d{2}"  # Regex for extracting publication year
-
-# --- OpenLibrary Mirror Settings ---
-openlibrary_mirror:
-  db_path: "openlibrary_mirror.db"  # Path to the local OpenLibrary mirror SQLite database
-  dump_url: "https://openlibrary.org/data/ol_dump_latest.txt.gz" # URL for the OpenLibrary data dump
-  update_interval_days: 7 # How often to check for mirror updates
-
-# --- LLM Fallback (Optional) ---
-self_hosted_llm: false         # If true, use a self-hosted LLM endpoint
-# LLM configuration (used for metadata enrichment if OpenLibrary fails or confidence is low)
-llm_provider:
-  # provider: "openai"
-  # api_key: "YOUR_API_KEY"
-  # model: "gpt-4-turbo-preview"
-  model: "gpt-4o"                # LLM model name
-  api_key_env: "OPENAI_API_KEY" # Environment variable for API key
-  url: "http://localhost:8000/chat"  # URL for self-hosted LLM
-  extra_lazy: false  # Use a smaller, less resource-intensive LLM
-
-llm_batch_size: 5                # Number of items per LLM enrichment batch
-
-# GUI configuration
-gui:
-  page_size: 35       # Number of books per page in GUI
-  book_view: true     # Show book-level view by default
-
-# OpenLibrary mirror configuration (preferred for enrichment)
-openlibrary:
-  use_local_mirror: true            # Use local OpenLibrary SQLite mirror if available
-  mirror_db: "./ol_mirror.sqlite"  # Path to local OpenLibrary mirror DB
-  cache_ttl_days: 30                # Days to cache OpenLibrary lookups
-  # List of OpenLibrary mirror URLs for the full "all types" dump (~12GB)
-  mirrors:
-    - url: "https://openlibrary.org/data/ol_dump_latest.txt.gz"           # Official OpenLibrary
-    - url: "https://archive.org/download/ol_exports_2024-06-01/ol_dump_latest.txt.gz"  # Fallback: Archive.org direct
-  # The updater will try each mirror in order if the previous fails.
-
-# Confidence thresholds (used to determine if LLM enrichment is needed)
+# --- Confidence Thresholds ---
+# These values determine how confident the application needs to be to perform certain actions automatically.
+# Values range from 0.0 (no confidence) to 1.0 (perfect confidence).
+# -----------------------------------------------------------------------------
 confidence:
-  min_confidence: 0.60              # Minimum confidence for auto-grouping (chaptered)
-  llm_threshold: 0.50               # Only use LLM if confidence is below this value
+  enrichment:
+    min_confidence: 0.70  # The minimum confidence score required to apply enriched metadata from sources like OpenLibrary.
+    llm_threshold: 0.50   # If enrichment confidence is below this value, the application may use an LLM for a more detailed analysis.
+  grouping:
+    min_confidence: 0.6   # The minimum confidence score required to automatically group files into a single book.
+
+# --- Large Language Model (LLM) Configuration ---
+# Settings for using an LLM (like OpenAI's GPT series) for advanced metadata enrichment.
+# -----------------------------------------------------------------------------
+llm_provider:
+  model: "gpt-4o"                                 # The specific LLM model to use (e.g., "gpt-4o", "gpt-3.5-turbo").
+  api_key_env: "TBD"                              # The name of the environment variable that holds your LLM API key. Set this to your actual key name.
+  url: "https://api.openai.com/v1/chat/completions" # The API endpoint for the LLM service.
+  extra_lazy: false                               # If true, the LLM will be used even more sparingly to save costs.
+llm_batch_size: 7                                 # The number of items to send to the LLM in a single request.
+self_hosted_llm: false                            # Set to true if you are using a local or self-hosted LLM endpoint.
+
+# --- OpenLibrary Mirror Configuration ---
+# For faster and more reliable lookups, the tool uses a local mirror of the OpenLibrary database.
+# On first launch, it downloads a TSV dump and converts it to a SQLite database.
+# -----------------------------------------------------------------------------
+openlibrary:
+  # Set to true to enable local lookups. If false, all lookups will be done via live API calls.
+  use_local_mirror: true
+
+  # URL for the full OpenLibrary TSV dump.
+  dump_url: https://openlibrary.org/data/ol_dump_latest.txt.gz
+
+  # Path to store the final SQLite mirror. Can be relative or absolute.
+  # e.g., "data/openlibrary/mirror.sqlite"
+  sqlite_path: "ol_mirror.sqlite"
+
+  # Legacy key for backward compatibility with older components. Should point to the same file as sqlite_path.
+  mirror_db: "ol_mirror.sqlite"
+
+  # How often (in days) to check for a new version of the dump.
+  min_update_days: 14
+
+  # How long to cache live API responses (in days).
+  cache_ttl_days: 30
+
+  # Set to true to use 'pigz' for faster decompression if it's available on your system's PATH.
+  # Falls back to standard 'gzip' if false or if 'pigz' is not found.
+  prefer_pigz: true
+
+# --- GUI Configuration ---
+# Customize the appearance of the graphical user interface.
+# -----------------------------------------------------------------------------
+gui:
+  theme: "DarkBlue3"      # The color theme for the GUI. A list of themes can be found in the PySimpleGUI documentation.
+  font_size: 10           # The default font size for the GUI.
+  dark_mode: true         # Set to true to enable dark mode by default.
+  page_size: 35           # The number of books to display on each page in the main list.
+  book_view: true         # If true, hides low-confidence groups from the main view by default.
+  # A list of columns to display in the main book list. Available columns are:
+  # "ID", "Authors", "Book", "Conf", "Discrep", "Type", "Source Path", "New Path"
+  columns:
+    - "ID"
+    - "Authors"
+    - "Book"
+    - "Conf"
+    - "Discrep"
+    - "Type"
+
+formatting:
+  # Define the folder structure for organized books. You can use placeholders like
+  # {author}, {series}, {series_index}, {title}, and {year}.
+  folder_template: "{author}/{series}/{title}"
+  # You can also specify a template for the filename itself.
+  # The {ext} placeholder will be replaced with the file's original extension.
+  filename_template: "{title} - {author}{ext}"
+
+  # You can also define a separate, more detailed template for books that are part of a series.
+  # The application will automatically use this template if series information is available.
+  filename_template_series: "{title} ({series} #{series_index:02d}) - {author}{ext}"

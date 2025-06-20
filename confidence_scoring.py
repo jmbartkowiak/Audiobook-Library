@@ -1,7 +1,7 @@
 """
 confidence_scoring.py
-Version: 2.2.2
-Last Update: 2025-06-10
+Version: 2.3.0
+Last Update: 2025-06-20
 
 This module provides comprehensive confidence scoring for audiobook organization, combining both grouping
 and enrichment confidence calculations. It implements multiple fuzzy matching algorithms and a weighted
@@ -525,8 +525,7 @@ class EnrichmentConfidence:
             'ol_ratio': 0.15,
             'file_count': 0.05,
             'size_consistency': 0.05,
-            'bitrate_consistency': 0.05,
-            'blacklist_penalty': 0.05  # Applied as multiplier at the end
+            'bitrate_consistency': 0.05
         }
         
         # Calculate weighted score

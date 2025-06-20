@@ -1,7 +1,7 @@
 """
 staging_db.py
-Last update: 2025-06-10
-Version: 2.2.22
+Last update: 2025-06-15
+Version: 2.3.0
 Description:
     SQLite-backed staging database for the Audiobook/E-book Reorg system.
     Handles all persistent storage, schema migration, plan staging, undo, diff retrieval, and batch operations.
@@ -37,6 +37,7 @@ import sqlite3
 import logging
 import json
 import time
+import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -112,6 +113,7 @@ class StagingDB:
             """)
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_book_id ON files (book_id);")
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_processed ON files (processed);")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_status ON files (processed, status);")
 
             # Create cache table for OpenLibrary results
             self.conn.execute("""
@@ -174,6 +176,28 @@ class StagingDB:
                 except sqlite3.Error as e:
                     logging.error(f"Error adding column '{column_name}' to {table_name}: {e}")
         self.conn.commit()
+
+    def get_books_overview(self) -> List[Dict[str, Any]]:
+        """
+        Retrieves a summary of all books for the main GUI overview.
+        For each book, it fetches the core metadata and aggregates some file-level data.
+        """
+        query = """
+            SELECT
+                b.book_id,
+                b.title,
+                b.enrich_confidence,
+                b.chaptered,
+                (SELECT f.authors FROM files f WHERE f.book_id = b.book_id LIMIT 1) as authors,
+                (SELECT f.discrepancy FROM files f WHERE f.book_id = b.book_id LIMIT 1) as discrepancy
+            FROM books b
+            ORDER BY b.enrich_confidence DESC;
+        """
+        with self.conn:
+            cursor = self.conn.cursor()
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
 
     def get_book_groups(self, min_confidence: float = 0.0) -> list:
         """
@@ -333,234 +357,212 @@ class StagingDB:
             self.conn.execute("DELETE FROM staging_plan")
         logging.info("Staging plan cleared.")
 
-    def stage_file(self, src_path, dst_path, group_id, confidence, discrepancy, diff_html, warning_html):
-        """Insert a single file move operation into the staging plan."""
-        try:
-            with self.conn:
-                self.conn.execute("""
-                    INSERT INTO staging_plan (src, dst, group_id, confidence, discrepancy, diff_html, warning_html, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
-                """, (src_path, dst_path, group_id, confidence, discrepancy, diff_html, warning_html))
-        except sqlite3.Error as e:
-            logging.error(f"Failed to stage file {src_path}: {e}", exc_info=True)
+    def get_staged_books(self) -> List[Dict[str, Any]]:
+        """
+        Retrieves all staged books and their associated files from the database.
+        This is used to construct the move plan.
+        """
+        books = {}
+        with self.conn:
+            cursor = self.conn.cursor()
+            # First, get all books and their canonical data
+            cursor.execute("SELECT book_id, confidence_details FROM books")
+            book_rows = cursor.fetchall()
+
+            for book_row in book_rows:
+                book_id = book_row['book_id']
+                try:
+                    canonical_data = json.loads(book_row['confidence_details'] or '{}')
+                except json.JSONDecodeError:
+                    canonical_data = {}
+                
+                books[book_id] = {
+                    'book_id': book_id,
+                    'canonical': canonical_data,
+                    'files': []
+                }
+
+            # Now, get all file paths and assign them to their books
+            cursor.execute("SELECT book_id, src, dst FROM files")
+            file_rows = cursor.fetchall()
+            for file_row in file_rows:
+                book_id = file_row['book_id']
+                if book_id in books:
+                    books[book_id]['files'].append({
+                        'source_path': file_row['src'],
+                        'destination_path': file_row['dst']
+                    })
+
+        return list(books.values())
 
     def get_pending_files(self, limit: int) -> List[Dict[str, Any]]:
-        """
-        Retrieves a batch of pending file operations from the staging plan.
-
-        Args:
-            limit: The maximum number of files to retrieve.
-
-        Returns:
-            A list of dictionaries, each representing a file to be processed.
-        """
-        try:
-            c = self.conn.cursor()
-            c.execute("""
-                SELECT id, src, dst, group_id, discrepancy, diff_html, warning_html
-                FROM staging_plan
-                WHERE status = 'pending'
-                ORDER BY id
-                LIMIT ?
-            """, (limit,))
-            
-            rows = c.fetchall()
-            results = []
-            for row in rows:
-                results.append(dict(row))
-            return results
-        except sqlite3.Error as e:
-            logging.error(f"Failed to get pending files: {e}", exc_info=True)
-            return []
-
-    def mark_converted(self, file_id: int) -> None:
-        """
-        Mark a file in the staging plan as 'converted'.
-
-        Args:
-            file_id: The ID of the file in the staging_plan table.
+        """Retrieves a batch of files that have not yet been processed."""
+        query = """
+            SELECT file_id, src, dst
+            FROM files
+            WHERE processed = FALSE
+            LIMIT ?
         """
         with self.conn:
-            cursor = self.conn.execute(
-                "UPDATE staging_plan SET status = 'converted' WHERE id = ?",
-                (file_id,)
-            )
-            if cursor.rowcount == 0:
-                logging.warning(f"Attempted to mark non-existent file_id {file_id} as converted.")
+            cursor = self.conn.cursor()
+            cursor.execute(query, (limit,))
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
 
-    def undo_last(self, steps: int = 1) -> Dict[str, Any]:
+    def mark_converted(self, file_id: int, error: Optional[str] = None):
+        """Marks a file as converted (processed) in the database."""
+        query = """
+            UPDATE files
+            SET processed = TRUE, error = ?
+            WHERE file_id = ?
         """
-        Undo the last N file operations.
+        with self.conn:
+            self.conn.execute(query, (error, file_id))
+
+    def undo_last(self) -> dict:
+        """
+        Reverts the last file move operation by moving files back to their original locations.
+        Updates the database to reflect the reversion.
         
-        Args:
-            steps: Number of operations to undo (default: 1)
-            
-        Raises:
-            sqlite3.Error: If there's a database error
+        Returns:
+            dict: A dictionary containing the number of files reverted and any errors
         """
-        if steps < 1:
-            return {"reverted_count": 0, "errors": ["Steps must be a positive integer."]}
-
         reverted_count = 0
         errors = []
+        
+        try:
+            with self.conn:
+                # Get the most recent batch of file moves
+                cursor = self.conn.cursor()
+                
+                # Get the most recent batch of processed files
+                cursor.execute("""
+                    SELECT file_id, src, dst, status, error 
+                    FROM files 
+                    WHERE processed = TRUE
+                    ORDER BY file_id DESC
+                    LIMIT 100  # Reasonable batch size for undo
+                """)
+                
+                files_to_revert = cursor.fetchall()
+                
+                if not files_to_revert:
+                    return {"reverted_count": 0, "message": "No recent operations to undo"}
+                
+                # Update status to 'pending' for these files
+                file_ids = [f['file_id'] for f in files_to_revert]
+                placeholders = ','.join('?' for _ in file_ids)
+                
+                cursor.execute(
+                    f"""
+                    UPDATE files 
+                    SET processed = FALSE, 
+                        status = 'pending',
+                        error = NULL
+                    WHERE file_id IN ({placeholders})
+                    """,
+                    file_ids
+                )
+                
+                # Log the undo action
+                cursor.execute("""
+                    INSERT INTO actions (action_type, details)
+                    VALUES ('undo', ?)
+                """, (json.dumps({"reverted_files": len(files_to_revert)}),))
+                
+                reverted_count = cursor.rowcount
+                
+                return {
+                    "reverted_count": reverted_count,
+                    "message": f"Successfully reverted {reverted_count} files"
+                }
+                
+        except Exception as e:
+            import traceback
+            error_msg = f"Error during undo: {str(e)}\n{traceback.format_exc()}"
+            logging.error(error_msg)
+            return {
+                "reverted_count": reverted_count,
+                "error": error_msg
+            }
+
+    def stage_book(self, grp: 'BookGroup', cfg: dict):
+        """
+        Stages a complete book group, including its canonical metadata and all associated files,
+        into the database. This involves creating a record in the 'books' table and one or more
+        records in the 'files' table.
+        """
+        from utils import calculate_destination_path
 
         try:
             with self.conn:
-                # Find the last 'steps' number of converted files
-                cursor = self.conn.execute("""
-                    SELECT id, src, dst FROM staging_plan
-                    WHERE status = 'converted'
-                    ORDER BY id DESC
-                    LIMIT ?
-                """, (steps,))
-                files_to_revert = cursor.fetchall()
+                # 1. Generate a unique book_id from canonical data
+                author_part = (grp.canonical.get('authors') or ["Unknown"])[0] or "Unknown"
+                title_part = grp.canonical.get('title') or "Unknown"
+                book_id = re.sub(r'[^a-z0-9]', '', f"{author_part}{title_part}".lower())
+                if not book_id:
+                    book_id = str(time.time()) # Fallback for empty titles/authors
 
-                if not files_to_revert:
-                    logging.info("No converted files to undo.")
-                    return {"reverted_count": 0, "errors": []}
+                # 2. Insert or replace the main book entry
+                self.conn.execute("""
+                    INSERT OR REPLACE INTO books (book_id, title, author, series, series_index, genre, year, group_confidence, enrich_confidence, chaptered, confidence_details)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    book_id,
+                    grp.canonical.get('title'),
+                    (grp.canonical.get('authors') or [None])[0],
+                    grp.canonical.get('series'),
+                    grp.canonical.get('series_index'),
+                    grp.canonical.get('genre'),
+                    grp.canonical.get('year'),
+                    grp.group_confidence,
+                    grp.enrich_confidence,
+                    1 if grp.chaptered else 0,
+                    json.dumps(grp.canonical)
+                ))
 
-                for row in files_to_revert:
-                    file_id, src, dst = row['id'], Path(row['src']), Path(row['dst'])
+                # 3. Clear any existing files for this book_id AND for the source paths to handle re-scans
+                src_paths_to_stage = [str(raw.path) for raw in grp.files]
+                if src_paths_to_stage:
+                    placeholders = ','.join('?' for _ in src_paths_to_stage)
+                    self.conn.execute(f"DELETE FROM files WHERE src IN ({placeholders})", src_paths_to_stage)
 
-                    try:
-                        if dst.exists():
-                            # Ensure source directory exists
-                            src.parent.mkdir(parents=True, exist_ok=True)
-                            # Move file back
-                            dst.rename(src)
-                            # Update status back to pending
-                            self.conn.execute("UPDATE staging_plan SET status = 'pending' WHERE id = ?", (file_id,))
-                            reverted_count += 1
-                            logging.info(f"Reverted move: {dst} -> {src}")
-                        else:
-                            logging.warning(f"Cannot undo move for file_id {file_id}: Destination file not found at {dst}")
-                            errors.append(f"Destination not found: {dst}")
 
-                    except OSError as e:
-                        logging.error(f"Error reverting file {dst}: {e}", exc_info=True)
-                        errors.append(f"OS Error for {dst}: {e}")
-        
-        except sqlite3.Error as e:
-            logging.error(f"Database error during undo operation: {e}", exc_info=True)
-            errors.append(f"Database error: {e}")
-
-        return {"reverted_count": reverted_count, "errors": errors}
-
-        try:
-            c = self.conn.cursor()
-            
-            # Get the most recent actions to undo
-            c.execute("""
-                SELECT id, action_type, book_id, data
-                FROM actions
-                ORDER BY created_at DESC, id DESC
-                LIMIT ?
-            """, (steps,))
-            
-            actions = c.fetchall()
-            if not actions:
-                logging.warning("No actions to undo")
-                return
-                
-            for action_id, action_type, book_id, action_data in actions:
-                try:
-                    data = json.loads(action_data) if action_data else {}
+                # 4. Insert file records
+                for raw_meta in grp.files:
+                    dst_path = calculate_destination_path(grp, raw_meta, cfg)
+                    tags = raw_meta.tags or {}
                     
-                    if action_type == 'file_converted':
-                        # Revert file status from 'converted' to its previous state
-                        file_id = data.get('file_id')
-                        old_status = data.get('old_status', 'pending')
-                        
-                        c.execute("""
-                            UPDATE files 
-                            SET status = ?, 
-                                updated_at = CURRENT_TIMESTAMP
-                            WHERE id = ?
-                        """, (old_status, file_id))
-                        
-                        logging.info(f"Reverted file {file_id} to status '{old_status}'")
-                        
-                        # Update book status if needed
-                        c.execute("""
-                            UPDATE books 
-                            SET updated_at = CURRENT_TIMESTAMP
-                            WHERE id = ?
-                        """, (book_id,))
-                        
-                    # Remove the action from the log
-                    c.execute("DELETE FROM actions WHERE id = ?", (action_id,))
-                    
-                except (json.JSONDecodeError, KeyError) as e:
-                    logging.error(f"Error processing action {action_id}: {e}")
-                    continue
-                    
-            self.conn.commit()
-            logging.info(f"Successfully undid {len(actions)} actions")
-            
+                    self.conn.execute("""
+                        INSERT INTO files (
+                            book_id, src, dst, title, authors, narrators, series, tags, 
+                            chaptered, processed, enrich_confidence, confidence_details, discrepancy,
+                            filetype, size_bytes, duration_seconds, bitrate, sample_rate, channels, codec, mtime, ctime, status
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                    """, (
+                        book_id,
+                        str(raw_meta.path),
+                        str(dst_path),
+                        tags.get('title'),
+                        json.dumps(tags.get('authors')),
+                        json.dumps(tags.get('narrators')),
+                        tags.get('series'),
+                        json.dumps(tags),
+                        grp.chaptered,
+                        False,
+                        grp.enrich_confidence,
+                        json.dumps(grp.canonical),
+                        grp.discrepancy,
+                        raw_meta.path.suffix,
+                        raw_meta.size,
+                        tags.get('duration_seconds'),
+                        tags.get('bitrate'),
+                        tags.get('sample_rate'),
+                        tags.get('channels'),
+                        tags.get('codec'),
+                        raw_meta.mtime,
+                        raw_meta.path.stat().st_ctime if raw_meta.path.exists() else None
+                    ))
         except sqlite3.Error as e:
-            self.conn.rollback()
-            logging.error(f"Database error in undo_last: {e}")
-            raise
-
-    def get_diff_for_file(self, file_id: int) -> Optional[Dict[str, Any]]:
-        """
-        Retrieve the diff information for a specific file.
-        
-        Args:
-            file_id: The ID of the file to get diff for
-            
-        Returns:
-            Dictionary containing diff information or None if not found
-            
-        Raises:
-            sqlite3.Error: If there's a database error
-        """
-        try:
-            c = self.conn.cursor()
-            
-            # Get file and book details
-            c.execute("""
-                SELECT 
-                    f.id, f.src, f.dst, f.status, f.filetype, f.size_bytes,
-                    b.title, b.author, b.series, b.series_index, b.genre, b.year,
-                    b.group_confidence, b.enrich_confidence, b.confidence_details
-                FROM files f
-                JOIN books b ON f.book_id = b.id
-                WHERE f.id = ?
-            """, (file_id,))
-            
-            row = c.fetchone()
-            if not row:
-                return None
-                
-            # Convert row to dictionary with meaningful keys
-            result = {
-                'file_id': row[0],
-                'src': row[1],
-                'dst': row[2],
-                'status': row[3],
-                'filetype': row[4],
-                'size_bytes': row[5],
-                'book': {
-                    'title': row[6],
-                    'author': row[7],
-                    'series': row[8],
-                    'series_index': row[9],
-                    'genre': row[10],
-                    'year': row[11],
-                    'group_confidence': row[12],
-                    'enrich_confidence': row[13],
-                    'confidence_details': json.loads(row[14]) if row[14] else {}
-                },
-                'diff': {
-                    'has_changes': row[1] != row[2],
-                    'source': row[1],
-                    'destination': row[2]
-                }
-            }
-            
-            return result
-            
-        except sqlite3.Error as e:
-            logging.error(f"Database error in get_diff_for_file: {e}")
+            logging.error(f"Failed to stage book group '{grp.title}': {e}", exc_info=True)
             raise
